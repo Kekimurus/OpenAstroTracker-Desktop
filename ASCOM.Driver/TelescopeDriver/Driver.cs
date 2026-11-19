@@ -48,6 +48,13 @@ namespace ASCOM.OpenAstroTracker
 		private long _fwVersion = 0;
 		private readonly object _fwVersionLock = new object();
 
+		// Whether the firmware answers :Gm# (side of pier). Older firmware does not reply to it at all, so each
+		// attempt costs a full receive timeout: probe once per connection and remember the answer.
+		private const int PierSideSupportUnknown = 0;
+		private const int PierSideSupported = 1;
+		private const int PierSideUnsupported = -1;
+		private int _pierSideSupport = PierSideSupportUnknown;
+
 		private ProfileData Profile => SharedResources.ReadProfile();
 
 		// 
@@ -217,6 +224,8 @@ namespace ASCOM.OpenAstroTracker
 				{
 					_isConnected = value;
 					SharedResources.Connected = value;
+					// The firmware may have been updated since the last connection: probe :Gm# again.
+					Interlocked.Exchange(ref _pierSideSupport, PierSideSupportUnknown);
 				}
 			}
 		}
@@ -833,6 +842,13 @@ namespace ASCOM.OpenAstroTracker
 		{
 			get
 			{
+				PierSide firmwareSide;
+				if (TryGetSideOfPierFromFirmware(out firmwareSide))
+				{
+					return firmwareSide;
+				}
+
+				// Fallback for firmware without :Gm#: guess from the hour angle.
 				// Read once to avoid multiple serial round-trips and to keep the comparison consistent.
 				double lst = SiderealTime;
 				double ra = RightAscension;
@@ -851,6 +867,52 @@ namespace ASCOM.OpenAstroTracker
 				LogMessage(LoggingFlags.Scope, "SideOfPier Set - Not Implemented");
 				throw new ASCOM.PropertyNotImplementedException("SideOfPier", true);
 			}
+		}
+
+		/// <summary>
+		/// Asks the firmware for its pointing state with :Gm#. It replies "E" (normal, pierEast), "W" (DEC turned
+		/// through the pole, pierWest) or "N" (unknown). Unlike the hour-angle guess, this does not change when
+		/// a target crosses the meridian while tracking, only when the mount actually goes through the pole.
+		/// Returns false when the firmware does not support the command, so the caller can fall back.
+		/// </summary>
+		private bool TryGetSideOfPierFromFirmware(out PierSide side)
+		{
+			side = PierSide.pierUnknown;
+			if (Interlocked.CompareExchange(ref _pierSideSupport, 0, 0) == PierSideUnsupported)
+			{
+				return false;
+			}
+
+			string reply = (CommandString(":Gm#,#") ?? string.Empty).Trim().TrimEnd('#');
+			switch (reply)
+			{
+				case "E":
+					side = PierSide.pierEast;
+					break;
+				case "W":
+					side = PierSide.pierWest;
+					break;
+				case "N":
+					side = PierSide.pierUnknown;
+					break;
+				default:
+					// Old firmware sends nothing back (the read times out and CommandString returns "255").
+					// Only decide "unsupported" on the first probe: once the command has worked on this
+					// connection, a bad reply is a one-off communication error, not missing support.
+					if (Interlocked.CompareExchange(ref _pierSideSupport, PierSideUnsupported, PierSideSupportUnknown) == PierSideSupportUnknown)
+					{
+						LogMessage(LoggingFlags.Scope, $"SideOfPier: firmware does not support :Gm# (reply '{reply}'), using the hour-angle estimate for this connection");
+					}
+					else
+					{
+						LogMessage(LoggingFlags.Scope, $"SideOfPier: unexpected :Gm# reply '{reply}', using the hour-angle estimate for this call");
+					}
+					return false;
+			}
+
+			Interlocked.Exchange(ref _pierSideSupport, PierSideSupported);
+			LogMessage(LoggingFlags.Scope, $"SideOfPier Get => {Enum.GetName(typeof(PierSide), side)} (firmware :Gm# '{reply}')");
+			return true;
 		}
 
 		public double SiderealTime
